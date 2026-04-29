@@ -5,7 +5,7 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import argparse
 
-def run_analysis(db_name='data/market_data.sqlite3', threshold=10.0, stability=45.0, window=11):
+def run_analysis(db_name='data/market_data.sqlite3', threshold=9.0, stability=30.0, window=10):
     if not os.path.exists(db_name):
         raise FileNotFoundError(f"Database not found: {db_name}")
 
@@ -21,35 +21,60 @@ def run_analysis(db_name='data/market_data.sqlite3', threshold=10.0, stability=4
 
     # --- 核心改进：强制冷却/平稳计数逻辑 ---
     # 定义异常状态和稳定状态
-    is_abnormal = df['volume'] > threshold
-    is_stable = (df['delta'].abs() <= stability) & (df['delta2'] <= stability)
+    # A. 异常放量 (当前分钟)
+    df['is_abnormal'] = df['volume'] > threshold
 
+    # B. 回溯检查 (过去 window 分钟必须都 <= threshold)
+    # 只要这层在，任何“过早解锁”引发的信号如果前面 10 分钟不干净，都会被拦截
+    df['previous_normal'] = df['volume'].shift(1).rolling(window=window).max() <= threshold
+    df['previous_normal'] = df['previous_normal'].fillna(True)
+
+    # C. 稳定性过滤
+    df['is_stable'] = (df['delta'].abs() <= stability)
+
+    # D. 频率控制与出场逻辑
     entry_signal = [False] * len(df)
+    exit_signal = [False] * len(df)
 
-    consecutive_normal_minutes = 0 # 记录连续平稳的分钟数
-    is_locked = False              # 是否处于锁定状态
+    # 调整变量以存储入场时间
+    in_position = False
+    entry_price = 0.0
+    entry_index = -1000  # 新增：记录入场时的索引位置
+    last_signal_idx = -1000
+    STOP_LOSS_LIMIT = 100.0
 
     for i in range(len(df)):
-        # 如果当前发生了异常 (放量)
-        if is_abnormal.iloc[i]:
-            # 如果没被锁定且满足波动稳定性，触发信号并加锁
-            if not is_locked and is_stable.iloc[i]:
+        # 1. 寻找入场
+        if not in_position:
+            if (df['is_abnormal'].iloc[i] and
+                df['previous_normal'].iloc[i] and
+                df['is_stable'].iloc[i] and
+                (i - last_signal_idx >= window)):
+
                 entry_signal[i] = True
-                is_locked = True
-                consecutive_normal_minutes = 0
-            else:
-                # 即使没触发信号，只要有异常，平稳计数器就重置
-                consecutive_normal_minutes = 0
+                in_position = True
+                entry_price = df['close'].iloc[i]
+                entry_index = i      # 记录入场索引
+                last_signal_idx = i
+
+        # 2. 监控出场
         else:
-            # 只有成交量平稳时，才累加平稳分钟数
-            consecutive_normal_minutes += 1
-            # 当平稳分钟数达到 window，解锁，允许下一次触发
-            if consecutive_normal_minutes >= window:
-                is_locked = False
+            # 条件 A：止损 (无时间限制，随时止损)
+            is_stop_loss = abs(df['close'].iloc[i] - entry_price) >= STOP_LOSS_LIMIT
+
+            # 条件 B：量能变盘出场 (必须在入场 5 分钟之后才生效)
+            is_volume_exit = df['is_abnormal'].iloc[i] and (i - entry_index >= 5)
+
+            if is_stop_loss or is_volume_exit:
+                exit_signal[i] = True
+                in_position = False
+                entry_price = 0.0
+                entry_index = -1000
 
     df['entry_signal'] = entry_signal
+    df['exit_signal'] = exit_signal
     signals = df[df['entry_signal']]
-    # ------------------------------------
+    exits = df[df['exit_signal']]
 
     # 3. 创建子图
     fig = make_subplots(rows=2, cols=1, shared_xaxes=True,
@@ -89,7 +114,17 @@ def run_analysis(db_name='data/market_data.sqlite3', threshold=10.0, stability=4
         marker=dict(symbol='arrow-down', color='#FFD700', size=12, line=dict(color='black', width=1))
     ), row=1, col=1)
 
-    # 7. 布局配置
+    # 7. 绘制出场信号箭头 (红色)
+    fig.add_trace(go.Scatter(
+        x=exits['timestamp'],
+        y=exits['low'] * 0.9995,  # 放在K线下方
+        mode='markers',
+        name='Exit Signal',
+        hoverinfo='skip',
+        marker=dict(symbol='arrow-up', color='#FF4500', size=12, line=dict(color='black', width=1))
+    ), row=1, col=1)
+
+    # 8. 布局配置
     fig.update_layout(
         title_text=f'Signals: Vol>{threshold}, Body/Range<={stability}, CoolingWindow={window}m',
         hovermode='x',
@@ -101,9 +136,9 @@ def run_analysis(db_name='data/market_data.sqlite3', threshold=10.0, stability=4
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--threshold', type=float, default=10.0, help="成交量异常阈值")
-    parser.add_argument('--stability', type=float, default=45.0, help="波动过滤阈值")
-    parser.add_argument('--window', type=int, default=11, help="需要连续平稳的分钟数(冷却期)")
+    parser.add_argument('--threshold', type=float, default=9.0, help="成交量异常阈值")
+    parser.add_argument('--stability', type=float, default=30.0, help="波动过滤阈值")
+    parser.add_argument('--window', type=int, default=10, help="需要连续平稳的分钟数(冷却期)")
     parser.add_argument('--db', type=str, default='data/market_data.sqlite3', help="数据库路径")
 
     args = parser.parse_args()
